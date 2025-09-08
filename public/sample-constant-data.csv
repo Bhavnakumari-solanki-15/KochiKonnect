@@ -1,0 +1,6 @@
+TrainID,TrainSetNumber,CarCount,Manufacturer,MaxSpeedKmph,DepotAssigned,BogieType,HVACType,BrandingType
+Train01,01,3,Alstom,80,Muttom,TypeX,ModelY,Standard
+Train02,02,3,Alstom,80,Muttom,TypeX,ModelY,Standard
+Train03,03,3,Alstom,80,Muttom,TypeX,ModelY,Standard
+Train04,04,3,Alstom,80,Muttom,TypeX,ModelY,Standard
+Train05,05,3,Alstom,80,Muttom,TypeX,ModelY,Standard

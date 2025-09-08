@@ -1,0 +1,9 @@
+train_id,model,status
+TR001,Siemens Desiro,active
+TR002,Alstom Coradia,active
+TR003,Bombardier Movia,maintenance
+TR004,Siemens Desiro,active
+TR005,Alstom Coradia,retired
+TR006,Bombardier Movia,active
+TR007,Siemens Desiro,active
+TR008,Alstom Coradia,maintenance

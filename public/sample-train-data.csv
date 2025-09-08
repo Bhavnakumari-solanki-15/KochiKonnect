@@ -1,0 +1,6 @@
+train_id,fitness_certificate_status,job_card_status,branding_priority,mileage,cleaning_status,stabling_position
+TR001,valid,clear,high,15000,clean,Platform A
+TR002,expired,open,medium,12000,pending,Platform B
+TR003,valid,clear,low,18000,clean,Platform C
+TR004,valid,open,high,9000,pending,Platform A
+TR005,expired,clear,medium,22000,clean,Platform D
