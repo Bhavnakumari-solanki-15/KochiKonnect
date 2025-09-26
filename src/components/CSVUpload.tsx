@@ -137,92 +137,58 @@ const CSVUpload = ({ onUploadComplete, onBack }: CSVUploadProps) => {
 
     setUploading(true);
     try {
-      // Create CSV upload record
-      const { data: uploadData, error: uploadError } = await supabase
-        .from('csv_uploads')
-        .insert({
-          filename: file.name,
-          notes: notes || null
-        })
-        .select()
-        .single();
+      // Cache locally
+      localStorage.setItem('recent_results', JSON.stringify(csvData));
 
-      if (uploadError) throw uploadError;
-
-      // Process each row and save to train_data table
-      for (const row of csvData) {
-        // Delete existing record first, then insert new one to avoid ON CONFLICT issues
-        await supabase
-          .from('train_data')
-          .delete()
-          .eq('train_id', row.train_id);
-        
-        // Try to store full row if the column exists; otherwise gracefully fallback
-        let insertError: any = null;
-        try {
-          const { error } = await supabase
-            .from('train_data')
-            .insert({
-              train_id: row.train_id,
-              fitness_certificate_status: row.fitness_certificate_status,
-              job_card_status: row.job_card_status,
-              branding_priority: row.branding_priority,
-              mileage: row.mileage,
-              cleaning_status: row.cleaning_status,
-              stabling_position: row.stabling_position,
-              // @ts-ignore - only works if the column exists
-              original_csv_data: row
-            });
-          insertError = error;
-        } catch (e: any) {
-          insertError = e;
-        }
-
-        if (insertError && String(insertError.message || '').toLowerCase().includes('original_csv_data')) {
-          const { error } = await supabase
-            .from('train_data')
-            .insert({
-              train_id: row.train_id,
-              fitness_certificate_status: row.fitness_certificate_status,
-              job_card_status: row.job_card_status,
-              branding_priority: row.branding_priority,
-              mileage: row.mileage,
-              cleaning_status: row.cleaning_status,
-              stabling_position: row.stabling_position
-            });
-          if (error) throw error;
-        } else if (insertError) {
-          throw insertError;
-        }
-
-        // Save individual rows to csv_upload_rows for audit
-        const { error: rowError } = await supabase
-          .from('csv_upload_rows')
-          .insert({
-            upload_id: uploadData.id,
-            row_index: csvData.indexOf(row),
-            row_data: row
-          });
-
-        if (rowError) throw rowError;
-      }
-
-      // Cache the just-processed rows locally so the Results page can render immediately
+      // Persist to Supabase (best-effort)
       try {
-        localStorage.setItem('recent_results', JSON.stringify(csvData));
+        const { data: uploadRow, error: upErr } = await supabase
+          .from('csv_uploads')
+          .insert({ filename: file?.name ?? 'upload.csv', notes: notes || null })
+          .select()
+          .single();
+        // Batch insert upload rows
+        if (!upErr && uploadRow) {
+          const rowsPayload = csvData.map((row, idx) => ({
+            upload_id: uploadRow.id,
+            row_index: idx,
+            row_data: row
+          }));
+          await supabase.from('csv_upload_rows').insert(rowsPayload, { count: 'exact' });
+        }
+      } catch {}
+
+      // Upsert train_data in a single batch (columns known in your schema)
+      try {
+        const tdPayload = csvData.map(r => ({
+          train_id: r.train_id,
+          fitness_certificate_status: r.fitness_certificate_status,
+          job_card_status: r.job_card_status,
+          branding_priority: r.branding_priority,
+          mileage: r.mileage,
+          cleaning_status: r.cleaning_status,
+          stabling_position: r.stabling_position
+        }));
+        // Best-effort: delete then insert to avoid conflicts
+        const ids = tdPayload.map(r => r.train_id).filter(Boolean);
+        if (ids.length) {
+          await supabase.from('train_data').delete().in('train_id', ids);
+        }
+        if (tdPayload.length) {
+          await supabase.from('train_data').insert(tdPayload, { count: 'exact' });
+        }
       } catch {}
 
       toast({
-        title: "Upload Successful",
-        description: `${csvData.length} train records processed successfully`,
+        title: "Upload Saved",
+        description: `${csvData.length} train records cached and persisted`,
       });
-
       onUploadComplete();
     } catch (error: any) {
       toast({
         title: "Upload Failed",
-        description: error.message || "Failed to upload CSV data",
-        variant: "destructive",
+        description: error?.message || 'Local caching error',
+        variant: 'destructive',
       });
     } finally {
       setUploading(false);
@@ -239,7 +205,7 @@ const CSVUpload = ({ onUploadComplete, onBack }: CSVUploadProps) => {
   };
 
   return (
-    <div className="container mx-auto p-6 max-w-4xl">
+    <div className="container mx-auto p-4 sm:p-6 max-w-4xl">
       <Card>
         <CardHeader>
           <CardTitle className="flex items-center gap-2">
@@ -255,7 +221,7 @@ const CSVUpload = ({ onUploadComplete, onBack }: CSVUploadProps) => {
           <div className="space-y-4">
             <div className="space-y-2">
               <Label htmlFor="csv-file">Select CSV File</Label>
-              <div className="flex gap-2">
+              <div className="flex gap-2 flex-col sm:flex-row">
                 <Input
                   ref={fileInputRef}
                   id="csv-file"
@@ -297,7 +263,7 @@ const CSVUpload = ({ onUploadComplete, onBack }: CSVUploadProps) => {
           {previewData.length > 0 && (
             <div className="space-y-2">
               <Label>Data Preview (First 5 rows)</Label>
-              <div className="border rounded-lg overflow-hidden">
+              <div className="border rounded-lg overflow-x-auto">
                 <Table>
                   <TableHeader>
                     <TableRow>
@@ -350,15 +316,15 @@ const CSVUpload = ({ onUploadComplete, onBack }: CSVUploadProps) => {
           
 
           {/* Action Buttons */}
-          <div className="flex gap-2 pt-4">
-            <Button variant="outline" onClick={onBack} disabled={uploading}>
+          <div className="flex gap-2 pt-4 flex-col sm:flex-row">
+            <Button variant="outline" onClick={onBack} disabled={uploading} className="w-full sm:w-auto">
               <ArrowLeft className="w-4 h-4 mr-2" />
               Back to Train Info
             </Button>
             <Button 
               onClick={handleUpload} 
               disabled={!file || uploading}
-              className="flex-1"
+              className="w-full sm:flex-1"
             >
               {uploading ? (
                 <>

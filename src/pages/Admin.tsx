@@ -5,12 +5,18 @@ import { Badge } from "@/components/ui/badge";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { Edit, Plus, Upload, ArrowRight, Train, FileText, X } from "lucide-react";
+import { Edit, Plus, Upload, ArrowRight, Train, FileText, X, Info } from "lucide-react";
+import { useNavigate, useLocation } from 'react-router-dom';
+import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } from "@/components/ui/dialog";
+import { Sheet, SheetContent, SheetHeader, SheetTitle, SheetDescription, SheetFooter, SheetTrigger } from "@/components/ui/sheet";
+import { Textarea } from "@/components/ui/textarea";
 import { useToast } from "@/hooks/use-toast";
 import { supabase } from "@/integrations/supabase/client";
 import TrainInfoForm from "@/components/TrainInfoForm";
 import CSVUpload from "@/components/CSVUpload";
+import DatasetUpload from "@/components/DatasetUpload";
 import { computeScore, type TrainRow, buildPromptFromRow, runScoring } from "@/lib/scoring";
+import { nsgaRank, normalizeObjectives, type NSGAItem } from "@/lib/nsga";
 
 interface TrainInfo {
   id: string;
@@ -22,11 +28,15 @@ interface TrainInfo {
 }
 
 const Admin = () => {
-  const [currentStep, setCurrentStep] = useState<'train-info' | 'csv-upload' | 'results'>('train-info');
+  const [currentStep, setCurrentStep] = useState<'dataset-upload' | 'train-info' | 'csv-upload' | 'results'>('dataset-upload');
   const [trainInfo, setTrainInfo] = useState<TrainInfo[]>([]);
   const [loading, setLoading] = useState(false);
   const [recentResults, setRecentResults] = useState<any[]>([]);
+  const [readyResults, setReadyResults] = useState<any[]>([]);
+  const [cleaningResults, setCleaningResults] = useState<any[]>([]);
+  const [maintenanceResults, setMaintenanceResults] = useState<any[]>([]);
   const [resultsLoading, setResultsLoading] = useState<boolean>(false);
+  const [resultsFilter, setResultsFilter] = useState<'all'|'ready'|'cleaning'|'maintenance'>('all');
   const [showTrainForm, setShowTrainForm] = useState(false);
   const [editingTrain, setEditingTrain] = useState<TrainInfo | null>(null);
   const [showCSVUpload, setShowCSVUpload] = useState(false);
@@ -35,6 +45,394 @@ const Admin = () => {
   const [previewData, setPreviewData] = useState<any[]>([]);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const { toast } = useToast();
+  const [infoOpen, setInfoOpen] = useState(false);
+  const [infoContent, setInfoContent] = useState<{ title: string; description: string } | null>(null);
+  const [aiLoading, setAiLoading] = useState<boolean>(false);
+  const [aiRankByTrain, setAiRankByTrain] = useState<Record<string, number>>({});
+  const [aiDialogOpen, setAiDialogOpen] = useState<boolean>(false);
+  const [aiCompareTable, setAiCompareTable] = useState<{train_id:string, pareto_rank:number|null, ai_rank:number|null, fitness?:string|null, job_cards?:string|null, branding?:string|null, mileage?:number|null, cleaning?:string|null, stabling?:string|null, updated?:string|null}[]>([]);
+  const navigate = useNavigate();
+  const location = useLocation();
+  const [fromFlow, setFromFlow] = useState<boolean>(false);
+
+  // What-If simulator state
+  const [whatIfQuery, setWhatIfQuery] = useState<string>("");
+  const [whatIfAnswer, setWhatIfAnswer] = useState<string>("");
+  const [whatIfLoading, setWhatIfLoading] = useState<boolean>(false);
+  const [whatIfOpen, setWhatIfOpen] = useState<boolean>(false);
+
+  const loadLatestRows = async (): Promise<any[]> => {
+    try {
+      const { data: listing } = await supabase
+        .from('listing')
+        .select('train_id, pareto_rank, fitness_certificate_status, job_card_status, branding_priority, mileage, cleaning_status, stabling_position, updated_at, processed_at')
+        .order('processed_at', { ascending: false })
+        .limit(100);
+      if (Array.isArray(listing) && listing.length) {
+        const latest: Record<string, any> = {};
+        for (const r of listing) if (r.train_id && !latest[r.train_id]) latest[r.train_id] = r;
+        return Object.values(latest);
+      }
+    } catch {}
+    try {
+      const { data } = await supabase
+        .from('train_data')
+        .select('train_id, fitness_certificate_status, job_card_status, branding_priority, mileage, cleaning_status, stabling_position, created_at, updated_at')
+        .order('created_at', { ascending: false })
+        .limit(100);
+      return (data || []);
+    } catch {}
+    return recentResults || [];
+  };
+
+  const recomputeNsgaRanks = (rows: any[]): any[] => {
+    const avgMileage = rows.reduce((a, b) => a + (Number(b.mileage) || 0), 0) / (rows.length || 1);
+    const rowsForNsga = rows.map((r: any) => {
+      const f = String(r.fitness_certificate_status || "").toLowerCase();
+      const j = String(r.job_card_status || "").toLowerCase();
+      const b = String(r.branding_priority || "").toLowerCase();
+      const c = String(r.cleaning_status || "").toLowerCase();
+      const stab = String(r.stabling_position || "").toLowerCase();
+      const mileageNum = typeof r.mileage === 'number' ? r.mileage : parseInt(String(r.mileage || '0'), 10) || 0;
+      const fitnessInvalid = (f.includes('expired') || f.includes('revoked') || f.includes('invalid')) ? 1 : 0;
+      const jobs = j.includes('open') || j.includes('major') || j.includes('critical') ? 1 : j.includes('minor') || j.includes('pending') ? 0.5 : 0;
+      const branding = b === 'high' ? 1 : b === 'medium' ? 0.5 : 0;
+      const mileageDev = Math.abs(mileageNum - avgMileage);
+      const cleaningNeed = c.includes('clean') ? 0 : 1;
+      const geometry = stab ? 0 : 0.5;
+      return { base: r, objectives: [fitnessInvalid, jobs, branding, mileageDev, cleaningNeed, geometry] };
+    });
+    const normalized = normalizeObjectives(rowsForNsga.map(r => r.objectives));
+    const items: NSGAItem<any>[] = normalized.map((obj, i) => ({ data: rowsForNsga[i].base, objectives: obj }));
+    const ranked = nsgaRank(items).map(it => ({ ...it.data, nsga_rank: it.rank, nsga_crowding: it.crowding }));
+    for (const r of ranked) {
+      const f = String(r.fitness_certificate_status || '').toLowerCase();
+      const c = String(r.cleaning_status || '').toLowerCase();
+      r.induction_category = (f.includes('expired') || f.includes('revoked') || f.includes('invalid'))
+        ? 'Inspection Bay (Maintenance)'
+        : (c.includes('pending') || c.includes('partial')) ? 'Cleaning / Detailing' : 'Revenue Service';
+    }
+    return ranked;
+  };
+
+  const runWhatIf = async () => {
+    try {
+      setWhatIfLoading(true);
+      setWhatIfAnswer("");
+      const q = whatIfQuery.trim();
+      if (!q) { setWhatIfAnswer("Enter a question like: What if Train 13 job card Closed?"); return; }
+
+      const trainNumMatch = q.match(/train\s*(?:no\.?|number)?\s*(\d+)/i);
+      let targetId: string | undefined;
+      if (trainNumMatch) {
+        const num = trainNumMatch[1];
+        const candidates = recentResults || [];
+        const found = candidates.find((r: any) => String(r.train_id).toLowerCase() === `train${num}`.toLowerCase())
+          || candidates.find((r: any) => String(r.train_id).endsWith(num));
+        targetId = found?.train_id;
+      }
+      if (!targetId) {
+        const idMatch = q.match(/train\s*([a-z]*\d+)/i);
+        if (idMatch) targetId = idMatch[1];
+      }
+
+      const original = (recentResults && recentResults.length) ? recentResults : await loadLatestRows();
+      if (!Array.isArray(original) || original.length === 0) { setWhatIfAnswer("No results available to simulate."); return; }
+
+      const modified = original.map(r => ({ ...r }));
+      const findIdx = () => modified.findIndex((r: any) => String(r.train_id) === String(targetId));
+      const applyToTarget = (fn: (o: any) => void) => { const i = findIdx(); if (i >= 0) fn(modified[i]); };
+      const low = q.toLowerCase();
+      const num = (s?: string) => { if (!s) return undefined; const n = Number(String(s).replace(/[\,\s]/g, '')); return isFinite(n) ? n : undefined; };
+      const changeNotes: string[] = [];
+
+      const jcAll = Array.from(low.matchAll(/job\s*card[s]?[^]*?(closed|open|major|minor|cosmetic)/g));
+      if (jcAll.length) { const v = jcAll[jcAll.length - 1][1]; applyToTarget(o => { o.job_card_status = v.charAt(0).toUpperCase() + v.slice(1); }); changeNotes.push(`Job Card → ${v}`); }
+
+      const fitAll = Array.from(low.matchAll(/fitness[^]*?(valid|expired|revoked|conditional)/g));
+      if (fitAll.length) { const v = fitAll[fitAll.length - 1][1]; applyToTarget(o => { o.fitness_certificate_status = v.charAt(0).toUpperCase() + v.slice(1); }); changeNotes.push(`Fitness → ${v}`); }
+
+      const incBy = Array.from(low.matchAll(/mileage[^]*?(?:increase|increased|add|plus)\s*by\s*(\d[\d,]*)/g));
+      const decBy = Array.from(low.matchAll(/mileage[^]*?(?:decrease|decreased|reduce|minus)\s*by\s*(\d[\d,]*)/g));
+      const setTo = Array.from(low.matchAll(/mileage[^]*?(?:to|=)\s*(\d[\d,]*)/g));
+      if (incBy.length) { const d = num(incBy[incBy.length - 1][1]) || 0; applyToTarget(o => { const cur = num(o.mileage) || 0; o.mileage = cur + d; }); changeNotes.push(`Mileage +${d}`); }
+      if (decBy.length) { const d = num(decBy[decBy.length - 1][1]) || 0; applyToTarget(o => { const cur = num(o.mileage) || 0; o.mileage = Math.max(0, cur - d); }); changeNotes.push(`Mileage -${d}`); }
+      if (setTo.length) { const v = num(setTo[setTo.length - 1][1]); if (v !== undefined) { applyToTarget(o => { o.mileage = v; }); changeNotes.push(`Mileage = ${v}`); } }
+
+      const cleanAll = Array.from(low.matchAll(/clean(?:ing)?[^]*?(scheduled|in[\s-]*progress|delayed|pending|completed|partial)/g));
+      if (cleanAll.length) {
+        const v = cleanAll[cleanAll.length - 1][1];
+        let mapped = v;
+        if (/pending|partial/.test(v)) mapped = 'InProgress';
+        if (/completed/.test(v)) mapped = 'Scheduled';
+        if (/in[\s-]*progress/.test(v)) mapped = 'InProgress';
+        if (/delayed/.test(v)) mapped = 'Delayed';
+        if (/scheduled/.test(v)) mapped = 'Scheduled';
+        applyToTarget(o => { o.cleaning_status = mapped; });
+        changeNotes.push(`Cleaning → ${mapped}`);
+      }
+
+      const brandAll = Array.from(low.matchAll(/brand(?:ing)?[^]*?(high|medium|low)/g));
+      if (brandAll.length) { const v = brandAll[brandAll.length - 1][1]; applyToTarget(o => { o.branding_priority = v.charAt(0).toUpperCase() + v.slice(1); }); changeNotes.push(`Branding → ${v}`); }
+
+      if (/(no\s*stabling|without\s*stabling)/i.test(q)) { applyToTarget(o => { o.stabling_position = ''; }); }
+      const stabTo = Array.from(low.matchAll(/stabling[^]*?(?:to|at|=)\s*([a-z0-9_-]+)/g));
+      if (stabTo.length) { const v = stabTo[stabTo.length - 1][1]; applyToTarget(o => { o.stabling_position = v; }); }
+
+      const ranked = recomputeNsgaRanks(modified);
+      if (!targetId) {
+        const top = ranked.slice(0, 5).map((r: any) => `${r.train_id}(${r.nsga_rank})`).join(', ');
+        setWhatIfAnswer(`Top 5: ${top}`);
+        setWhatIfLoading(false);
+        return;
+      }
+
+      const before = original.find((r: any) => String(r.train_id) === String(targetId));
+      const after = ranked.find((r: any) => String(r.train_id) === String(targetId));
+      const newRank = (after as any)?.nsga_rank ?? '-';
+      const oldRank = (before as any)?.nsga_rank ?? '-';
+
+      const beforeCat = (() => {
+        const f = String((before as any)?.fitness_certificate_status || '').toLowerCase();
+        const c = String((before as any)?.cleaning_status || '').toLowerCase();
+        return (f.includes('expired') || f.includes('revoked') || f.includes('invalid'))
+          ? 'Inspection Bay (Maintenance)'
+          : (c.includes('pending') || c.includes('partial') || c.includes('inprogress') || c.includes('delayed'))
+            ? 'Cleaning / Detailing' : 'Revenue Service';
+      })();
+      const afterCat = String((after as any)?.induction_category || '').trim() || (() => {
+        const f = String((after as any)?.fitness_certificate_status || '').toLowerCase();
+        const c = String((after as any)?.cleaning_status || '').toLowerCase();
+        return (f.includes('expired') || f.includes('revoked') || f.includes('invalid'))
+          ? 'Inspection Bay (Maintenance)'
+          : (c.includes('pending') || c.includes('partial') || c.includes('inprogress') || c.includes('delayed'))
+            ? 'Cleaning / Detailing' : 'Revenue Service';
+      })();
+
+      const movement = ((): string => {
+        if (beforeCat !== afterCat) {
+          if (afterCat.includes('Inspection')) return 'Moved to Inspection Bay (removed from service)';
+          if (beforeCat.includes('Inspection')) return 'Returned to service';
+          if (afterCat.includes('Cleaning')) return 'Moved to Cleaning/Detailing';
+          if (beforeCat.includes('Cleaning')) return 'Returned to Revenue Service';
+        }
+        if (typeof oldRank === 'number' && typeof newRank === 'number') {
+          if (newRank < oldRank) return 'Up';
+          if (newRank > oldRank) return 'Down';
+          return 'No change';
+        }
+        return 'Updated';
+      })();
+      const concise = `${String(targetId)}: ${oldRank}→${newRank}; ${movement}; Category: ${beforeCat}→${afterCat}${changeNotes.length ? `; Reason: ${changeNotes[0]}.` : '.'}`;
+      setWhatIfAnswer(concise);
+    } catch (e: any) {
+      setWhatIfAnswer(e?.message || 'What-If simulation failed');
+    } finally {
+      setWhatIfLoading(false);
+    }
+  };
+
+  const compareWithAI = async () => {
+    try {
+      setAiLoading(true);
+      // Build payload from the currently visible results (use the unified recentResults list)
+      const buildFeature = (r: any) => ({
+        train_id: r.train_id,
+        fitness_certificate_status: r.fitness_certificate_status ?? r.model ?? '',
+        job_card_status: r.job_card_status ?? r.status ?? '',
+        branding_priority: r.branding_priority ?? '',
+        mileage: typeof r.mileage === 'number' ? r.mileage : (parseInt(String(r.mileage || '0'), 10) || 0),
+        cleaning_status: r.cleaning_status ?? '',
+        stabling_position: r.stabling_position ?? ''
+      });
+
+      // Decide which list to use based on filter
+      let source: any[] = recentResults;
+      if (resultsFilter === 'ready') source = readyResults;
+      else if (resultsFilter === 'cleaning') source = cleaningResults;
+      else if (resultsFilter === 'maintenance') source = maintenanceResults;
+
+      const trains = source.map(buildFeature).filter(t => t.train_id);
+      if (trains.length === 0) {
+        toast({ title: 'No rows to compare', description: 'Upload or select results first.' });
+        return;
+      }
+
+      // Try remote predictions first; if it fails or returns empty, fall back to local scoring-derived ranks
+      const map: Record<string, number> = {};
+      let usedFallback = false;
+      try {
+        const res = await fetch('https://kochi-ml-api.onrender.com/predict/batch', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ trains })
+        });
+        if (!res.ok) throw new Error(`API ${res.status}`);
+        const json = await res.json();
+        const preds = json?.predictions || [];
+        for (const p of preds) {
+          if (p.train_id) map[p.train_id] = Number(p.predicted_rank);
+        }
+        if (Object.keys(map).length === 0) throw new Error('Empty predictions');
+      } catch {
+        // Fallback: compute local AI rank using computeScore and convert to rank ordering
+        usedFallback = true;
+        // Compute average mileage to feed scoring
+        const avgMileage = trains.reduce((a, b) => a + (Number(b.mileage) || 0), 0) / (trains.length || 1);
+        const scored = trains.map(t => {
+          const row: TrainRow = {
+            trainId: t.train_id,
+            fitnessCerts: String(t.fitness_certificate_status || '').toLowerCase().includes('valid') ? 'Valid' : (String(t.fitness_certificate_status || '').toLowerCase().includes('expired') ? 'Expired' : 'Conditional'),
+            workOrders: String(t.job_card_status || '').toLowerCase().includes('open') ? 'Major' : String(t.job_card_status || '').toLowerCase().includes('minor') ? 'Minor' : 'Closed',
+            mileageStatus: 'Balanced',
+            wrapExposure: String(t.branding_priority || '').toLowerCase() === 'high' ? 'Behind' : 'OnTarget',
+            cleaningSlot: String(t.cleaning_status || '').toLowerCase().includes('clean') ? 'Available' : 'NotAvailable',
+            stabling: t.stabling_position ? 'Optimal' : 'Moderate',
+            // @ts-ignore
+            mileage: Number(t.mileage) || 0
+          };
+          const { total } = computeScore(row, { fleetAvgKm30d: avgMileage });
+          return { id: t.train_id, score: total };
+        })
+        .sort((a, b) => b.score - a.score);
+        // Assign ranks 1..n based on descending score
+        scored.forEach((s, idx) => { map[s.id] = idx + 1; });
+      }
+      // Debug: compare AI vs Pareto in console for a short while
+      try {
+        const compareRows = source.map((r: any) => ({
+          train_id: r.train_id,
+          pareto_rank: typeof r.nsga_rank === 'number' ? r.nsga_rank : null,
+          ai_rank: map[r.train_id] ?? null,
+          ai_rank_precise: map[r.train_id] !== undefined ? Number(map[r.train_id]).toFixed(6) : null,
+        }));
+        const matches = compareRows.filter(row => row.pareto_rank != null && row.ai_rank != null && Number(row.pareto_rank) === Number(row.ai_rank)).length;
+        // eslint-disable-next-line no-console
+        console.groupCollapsed('[AI Compare] Pareto vs AI Rank');
+        // eslint-disable-next-line no-console
+        console.table(compareRows);
+        // eslint-disable-next-line no-console
+        console.log(`Matched ranks: ${matches}/${compareRows.length}`);
+        // Basic metrics when both present
+        const diffs = compareRows
+          .filter(r => r.pareto_rank != null && r.ai_rank != null)
+          .map(r => Math.abs(Number(r.pareto_rank) - Number(r.ai_rank)));
+        if (diffs.length) {
+          const mae = diffs.reduce((a, b) => a + b, 0) / diffs.length;
+          const rmse = Math.sqrt(diffs.reduce((a, b) => a + b * b, 0) / diffs.length);
+          // eslint-disable-next-line no-console
+          console.log(`MAE: ${mae.toFixed(3)} | RMSE: ${rmse.toFixed(3)}`);
+        }
+        // Expose for manual console checks
+        // @ts-ignore
+        (window as any).aiPredictionsMap = map;
+        // @ts-ignore
+        (window as any).aiCompareRows = compareRows;
+        // Optional: auto-close group after a short delay
+        setTimeout(() => {
+          // eslint-disable-next-line no-console
+          console.groupEnd?.();
+        }, 4000);
+      } catch {}
+      setAiRankByTrain(map);
+      // Build dialog rows from current source + map (outside debug scope)
+      const rowsForDialog = source.map((r:any) => ({
+        train_id: r.train_id,
+        pareto_rank: typeof r.nsga_rank === 'number' ? r.nsga_rank : null,
+        ai_rank: map[r.train_id] ?? null,
+        fitness: r.fitness_certificate_status ?? r.model ?? null,
+        job_cards: r.job_card_status ?? r.status ?? null,
+        branding: r.branding_priority ?? null,
+        mileage: typeof r.mileage === 'number' ? r.mileage : (parseInt(String(r.mileage||'0'),10)||0),
+        cleaning: r.cleaning_status ?? null,
+        stabling: r.stabling_position ?? null,
+        updated: (r.updated_at || r.created_at) ? new Date(r.updated_at || r.created_at).toLocaleString() : null,
+        info: (() => {
+          const f = r.fitness_certificate_status ?? r.model ?? '-';
+          const j = r.job_card_status ?? r.status ?? '-';
+          const b = r.branding_priority ?? '-';
+          const m = typeof r.mileage === 'number' ? r.mileage.toLocaleString() : (r.mileage ?? '-');
+          const c = r.cleaning_status ?? '-';
+          const s = r.stabling_position ?? '-';
+          const cat = r.induction_category ?? '-';
+          const rk = r.nsga_rank ?? '-';
+          const name = r.train_id || 'This train';
+          return `${name} is ranked ${rk} (${cat}). Fitness is ${f}; job cards are ${j}. Branding is ${b}; mileage is ${m} km. Cleaning is ${c}; stabling is ${s}.`;
+        })(),
+      }));
+      setAiCompareTable(rowsForDialog);
+      toast({ title: usedFallback ? 'AI comparison (local)' : 'AI comparison ready', description: usedFallback ? 'Used local model as a fallback.' : 'Showing AI-predicted rank next to Pareto Rank.' });
+      // Navigate to compare page with state
+      navigate('/compare-ai', { state: { rows: rowsForDialog } });
+    } catch (e: any) {
+      // As an ultimate fallback, try to navigate with Pareto-only rows
+      try {
+        const source: any[] = recentResults.length ? recentResults : [];
+        if (source.length) {
+          const rowsForDialog = source.map((r:any) => ({
+            train_id: r.train_id,
+            pareto_rank: typeof r.nsga_rank === 'number' ? r.nsga_rank : null,
+            ai_rank: null,
+            fitness: r.fitness_certificate_status ?? r.model ?? null,
+            job_cards: r.job_card_status ?? r.status ?? null,
+            branding: r.branding_priority ?? null,
+            mileage: typeof r.mileage === 'number' ? r.mileage : (parseInt(String(r.mileage||'0'),10)||0),
+            cleaning: r.cleaning_status ?? null,
+            stabling: r.stabling_position ?? null,
+            updated: (r.updated_at || r.created_at) ? new Date(r.updated_at || r.created_at).toLocaleString() : null,
+            info: ''
+          }));
+          navigate('/compare-ai', { state: { rows: rowsForDialog } });
+          toast({ title: 'AI compare failed', description: 'Showing Pareto-only results.', variant: 'destructive' });
+        } else {
+          toast({ title: 'AI compare failed', description: e?.message || 'Could not fetch predictions', variant: 'destructive' });
+        }
+      } catch {
+        toast({ title: 'AI compare failed', description: e?.message || 'Could not fetch predictions', variant: 'destructive' });
+      }
+    } finally {
+      setAiLoading(false);
+    }
+  };
+
+  const renderInfoCell = (r: any) => {
+    let explanation: string = r.explanation || '';
+    if (!explanation) {
+      const f = r.fitness_certificate_status ?? r.model ?? '-';
+      const j = r.job_card_status ?? r.status ?? '-';
+      const b = r.branding_priority ?? '-';
+      const m = typeof r.mileage === 'number' ? r.mileage.toLocaleString() : (r.mileage ?? '-');
+      const c = r.cleaning_status ?? '-';
+      const s = r.stabling_position ?? '-';
+      const cat = r.induction_category ?? '-';
+      const rk = r.nsga_rank ?? '-';
+      const name = r.train_id || 'This train';
+      explanation = `${name} is ranked ${rk} (${cat}). Fitness is ${f}; job cards are ${j}. ` +
+        `Branding is ${b}; mileage is ${m} km. Cleaning is ${c}; stabling is ${s}.`;
+    }
+    const conflicts: string[] = Array.isArray(r.conflicts) ? r.conflicts : [];
+    const alerts: string[] = [];
+    if (r.alert_fitness_invalid) alerts.push('Fitness invalid');
+    if (r.alert_job_open) alerts.push('Open job cards');
+    if (r.alert_cleaning_pending) alerts.push('Cleaning pending');
+    if (r.alert_cleaning_partial) alerts.push('Cleaning partial');
+    if (r.alert_no_stabling) alerts.push('No stabling');
+    const text = [
+      explanation ? `Why: ${explanation}` : '',
+      alerts.length ? `Alerts: ${alerts.join(', ')}` : '',
+      conflicts.length ? `Conflicts: ${conflicts.join(' | ')}` : ''
+    ].filter(Boolean).join('\n\n');
+    if (!text) return <span className="text-xs text-muted-foreground">—</span>;
+    return (
+      <button
+        onClick={() => { setInfoContent({ title: r.train_id || 'Train', description: text }); setInfoOpen(true); }}
+        title="View explanation and alerts"
+        className="inline-flex items-center text-blue-600 hover:underline"
+      >
+        <Info className="w-4 h-4" />
+      </button>
+    );
+  };
 
   const fetchTrainInfo = async () => {
     setLoading(true);
@@ -119,25 +517,120 @@ const Admin = () => {
   };
 
   const handleCSVUploaded = () => {
+    setFromFlow(true);
     setCurrentStep('results');
   };
 
   const saveListing = async (rows: any[]) => {
     if (!Array.isArray(rows) || rows.length === 0) return;
-    const payload = rows.map((r: any) => ({
-      train_id: r.train_id,
-      score: Number(r.score ?? 0),
-      fitness_certificate_status: r.fitness_certificate_status ?? null,
-      job_card_status: r.job_card_status ?? null,
-      branding_priority: r.branding_priority ?? null,
-      mileage: typeof r.mileage === 'number' ? r.mileage : (parseInt(String(r.mileage || '0')) || 0),
-      cleaning_status: r.cleaning_status ?? null,
-      stabling_position: r.stabling_position ?? null,
-      listed_at: new Date().toISOString()
-    }));
+    
+    // Generate unique batch ID for this upload
+    const uploadBatchId = crypto.randomUUID();
+    const processedAt = new Date().toISOString();
+    
+    // Get current count of each train in the database
+    const trainCounts: Record<string, number> = {};
+    for (const row of rows) {
+      const trainId = row.train_id;
+      if (trainId) {
+        const { count } = await supabase
+          .from('listing')
+          .select('*', { count: 'exact', head: true })
+          .eq('train_id', trainId);
+        trainCounts[trainId] = (count || 0) + 1;
+      }
+    }
+    
+    const avgMileage = (() => {
+      const vals = rows.map((r: any) => (typeof r.mileage === 'number' ? r.mileage : parseInt(String(r.mileage || '0')) || 0));
+      const sum = vals.reduce((a, b) => a + b, 0);
+      return vals.length ? sum / vals.length : 0;
+    })();
+    const payload = rows.map((r: any) => {
+      let scoreNum: number | undefined = typeof r.score === 'number' ? r.score : undefined;
+      if (scoreNum === undefined) {
+        // Fallback: compute a local score similar to listing view
+        const row: TrainRow = {
+          trainId: r.train_id,
+          fitnessCerts: String(r.fitness_certificate_status || '').toLowerCase().includes('valid') ? 'Valid' : (String(r.fitness_certificate_status || '').toLowerCase().includes('expired') ? 'Expired' : 'Conditional'),
+          workOrders: String(r.job_card_status || '').toLowerCase().includes('open') ? 'Major' : String(r.job_card_status || '').toLowerCase().includes('minor') ? 'Minor' : 'Closed',
+          mileageStatus: 'Balanced',
+          wrapExposure: String(r.branding_priority || '').toLowerCase() === 'high' ? 'Behind' : 'OnTarget',
+          cleaningSlot: String(r.cleaning_status || '').toLowerCase().includes('clean') ? 'Available' : 'NotAvailable',
+          stabling: r.stabling_position ? 'Optimal' : 'Moderate',
+          // @ts-ignore
+          mileage: typeof r.mileage === 'number' ? r.mileage : (parseInt(String(r.mileage || '0')) || 0)
+        };
+        scoreNum = computeScore(row, { fleetAvgKm30d: avgMileage }).total;
+      }
+      const fitnessTxt = String(r.fitness_certificate_status || '').toLowerCase();
+      const cleaningTxt = String(r.cleaning_status || '').toLowerCase();
+      let category: string = 'Revenue Service';
+      if (fitnessTxt.includes('expired') || fitnessTxt.includes('invalid') || fitnessTxt.includes('revoked')) category = 'Inspection Bay (Maintenance)';
+      else if (cleaningTxt.includes('pending') || cleaningTxt.includes('partial')) category = 'Cleaning / Detailing';
+
+      // Generate explanation, alerts, and conflicts like in renderInfoCell
+      let explanation: string = r.explanation || '';
+      if (!explanation) {
+        const f = r.fitness_certificate_status ?? r.model ?? '-';
+        const j = r.job_card_status ?? r.status ?? '-';
+        const b = r.branding_priority ?? '-';
+        const m = typeof r.mileage === 'number' ? r.mileage.toLocaleString() : (r.mileage ?? '-');
+        const c = r.cleaning_status ?? '-';
+        const s = r.stabling_position ?? '-';
+        const cat = r.induction_category ?? category;
+        const rk = r.nsga_rank ?? '-';
+        const name = r.train_id || 'This train';
+        explanation = `${name} is ranked ${rk} (${cat}). Fitness is ${f}; job cards are ${j}. ` +
+          `Branding is ${b}; mileage is ${m} km. Cleaning is ${c}; stabling is ${s}.`;
+      }
+      
+      const conflicts: string[] = Array.isArray(r.conflicts) ? r.conflicts : [];
+      const alerts: string[] = [];
+      if (r.alert_fitness_invalid) alerts.push('Fitness invalid');
+      if (r.alert_job_open) alerts.push('Open job cards');
+      if (r.alert_cleaning_pending) alerts.push('Cleaning pending');
+      if (r.alert_cleaning_partial) alerts.push('Cleaning partial');
+      if (r.alert_no_stabling) alerts.push('No stabling');
+
+      return {
+        train_id: r.train_id,
+        pareto_rank: typeof r.nsga_rank === 'number' ? r.nsga_rank : null,
+        fitness_certificate_status: r.fitness_certificate_status ?? null,
+        job_card_status: r.job_card_status ?? null,
+        branding_priority: r.branding_priority ?? null,
+        mileage: typeof r.mileage === 'number' ? Math.trunc(r.mileage) : (parseInt(String(r.mileage || '0')) || 0),
+        cleaning_status: r.cleaning_status ?? null,
+        stabling_position: r.stabling_position ?? null,
+        category: category,
+        explanation: explanation,
+        alerts: JSON.stringify(alerts),
+        conflicts: JSON.stringify(conflicts),
+        upload_batch_id: uploadBatchId,
+        upload_count: trainCounts[r.train_id] || 1,
+        processed_at: processedAt,
+        updated_at: new Date().toISOString()
+      };
+    });
     try {
-      await supabase.from('listing').upsert(payload, { onConflict: 'train_id' });
-    } catch {}
+      // Always insert new rows for each upload (no updates)
+      const { error } = await supabase
+        .from('listing')
+        .insert(payload);
+
+      if (error) {
+        console.error('listing insert error', error);
+        toast({ title: 'Save failed', description: error.message || 'Could not save listing', variant: 'destructive' });
+      } else {
+        toast({ 
+          title: 'Success', 
+          description: `Added ${payload.length} new train records to listing` 
+        });
+      }
+    } catch (e: any) {
+      console.error('listing save exception', e);
+      toast({ title: 'Save failed', description: e.message || 'Could not save listing', variant: 'destructive' });
+    }
   };
 
   const scoreCachedResults = async () => {
@@ -166,23 +659,51 @@ const Admin = () => {
           wrapExposure: String(r.branding_priority || '').toLowerCase() === 'high' ? 'Behind' : 'OnTarget',
           cleaningSlot: String(r.cleaning_status || '').toLowerCase().includes('clean') ? 'Available' : 'NotAvailable',
           stabling: r.stabling_position ? 'Optimal' : 'Moderate',
-          // @ts-ignore store mileage for compute context
+          // @ts-ignore
           mileage: Number(r.mileage) || 0
         };
-        let { total } = computeScore(row, { fleetAvgKm30d: avgMileage });
-        try {
-          if (import.meta.env.VITE_OPENROUTER_API_KEY || import.meta.env.VITE_GROQ_API_KEY) {
-            const prompt = buildPromptFromRow(row);
-            const apiRes = await runScoring(prompt, row);
-            const parsedNum = typeof apiRes === 'number' ? apiRes : parseFloat(String(apiRes).match(/-?\d+(?:\.\d+)?/)?.[0] || '');
-            if (!Number.isNaN(parsedNum)) total = parsedNum;
-          }
-        } catch {}
+        const { total } = computeScore(row, { fleetAvgKm30d: avgMileage });
         return { ...r, score: total };
       }));
-      const ranked = scored.sort((a: any, b: any) => (b.score ?? 0) - (a.score ?? 0));
-      setRecentResults(ranked);
-      saveListing(ranked);
+
+      // NSGA-II ranking and grouping for cached rows
+      const rowsForNsga = scored.map((r: any) => {
+        const f = String(r.fitness_certificate_status || '').toLowerCase();
+        const j = String(r.job_card_status || '').toLowerCase();
+        const b = String(r.branding_priority || '').toLowerCase();
+        const c = String(r.cleaning_status || '').toLowerCase();
+        const stab = String(r.stabling_position || '').toLowerCase();
+        const mileageNum = typeof r.mileage === 'number' ? r.mileage : parseInt(String(r.mileage || '0'), 10) || 0;
+        const fitnessInvalid = (f.includes('expired') || f.includes('revoked')) ? 1 : 0;
+        const jobs = j.includes('open') || j.includes('major') || j.includes('critical') ? 1 : j.includes('minor') || j.includes('pending') ? 0.5 : 0;
+        const branding = b === 'high' ? 1 : b === 'medium' ? 0.5 : 0;
+        const mileageDev = Math.abs(mileageNum - avgMileage);
+        const cleaningNeed = c.includes('clean') ? 0 : 1;
+        const geometry = stab ? 0 : 0.5;
+        return { base: r, objectives: [fitnessInvalid, jobs, branding, mileageDev, cleaningNeed, geometry] };
+      });
+      const normalized = normalizeObjectives(rowsForNsga.map(r => r.objectives));
+      const items: NSGAItem<any>[] = normalized.map((obj, i) => ({ data: rowsForNsga[i].base, objectives: obj }));
+      const rankedNsga = nsgaRank(items).map(it => ({ ...it.data, nsga_rank: it.rank, nsga_crowding: it.crowding }));
+
+      const groups = { ready: [] as any[], cleaning: [] as any[], maintenance: [] as any[] };
+      for (const r of rankedNsga) {
+        const f = String(r.fitness_certificate_status || '').toLowerCase();
+        const j = String(r.job_card_status || '').toLowerCase();
+        const c = String(r.cleaning_status || '').toLowerCase();
+        const isInvalid = f.includes('expired') || f.includes('revoked') || f.includes('invalid');
+        const hasOpen = j.includes('open') || j.includes('major') || j.includes('critical');
+        let cat: 'ready'|'cleaning'|'maintenance' = 'ready';
+        if (isInvalid) cat = 'maintenance';
+        else if (c.includes('pending')) cat = 'cleaning';
+        (groups[cat] as any[]).push(r);
+      }
+
+      setRecentResults(rankedNsga);
+      setReadyResults(groups.ready);
+      setCleaningResults(groups.cleaning);
+      setMaintenanceResults(groups.maintenance);
+      try { await saveListing(rankedNsga); } catch {}
       return true;
     } catch {
       return false;
@@ -270,17 +791,44 @@ const Admin = () => {
           // Local baseline
           let { total } = computeScore(row, { fleetAvgKm30d: avgMileage });
           // Try API scoring if keys present
-          try {
-            if (import.meta.env.VITE_OPENROUTER_API_KEY || import.meta.env.VITE_GROQ_API_KEY) {
-              const prompt = buildPromptFromRow(row);
-              const apiRes = await runScoring(prompt, row);
-              const parsed = typeof apiRes === 'number' ? apiRes : parseFloat(String(apiRes).match(/-?\d+(?:\.\d+)?/)?.[0] || '');
-              if (!Number.isNaN(parsed)) total = parsed;
-            }
-          } catch {}
+          // Remote scoring disabled; use local computeScore result
           return { ...t, ...r, score: total };
         }))
         .sort((a: any, b: any) => (b.score ?? 0) - (a.score ?? 0));
+
+        // NSGA-II multi-objective ranking using six proxies
+        const rowsForNsga = enriched.map((r: any) => {
+          const f = String(r.fitness_certificate_status || r.model || '').toLowerCase();
+          const j = String(r.job_card_status || r.status || '').toLowerCase();
+          const b = String(r.branding_priority || '').toLowerCase();
+          const c = String(r.cleaning_status || '').toLowerCase();
+          const stab = String(r.stabling_position || '').toLowerCase();
+          const mileageNum = typeof r.mileage === 'number' ? r.mileage : parseInt(String(r.mileage || '0'), 10) || 0;
+          const fitnessInvalid = (f.includes('expired') || f.includes('revoked')) ? 1 : 0;
+          const jobs = j.includes('open') || j.includes('major') || j.includes('critical') ? 1 : j.includes('minor') || j.includes('pending') ? 0.5 : 0;
+          const branding = b === 'high' ? 1 : b === 'medium' ? 0.5 : 0;
+          const mileageDev = Math.abs(mileageNum - avgMileage);
+          const cleaningNeed = c.includes('clean') ? 0 : 1;
+          const geometry = stab ? 0 : 0.5;
+          return { base: r, objectives: [fitnessInvalid, jobs, branding, mileageDev, cleaningNeed, geometry] };
+        });
+        const normalized = normalizeObjectives(rowsForNsga.map(r => r.objectives));
+        const items: NSGAItem<any>[] = normalized.map((obj, i) => ({ data: rowsForNsga[i].base, objectives: obj }));
+        const rankedNsga = nsgaRank(items).map(it => ({ ...it.data, nsga_rank: it.rank, nsga_crowding: it.crowding }));
+
+        // Classify into three lists
+        const groups = { ready: [] as any[], cleaning: [] as any[], maintenance: [] as any[] };
+        for (const r of rankedNsga) {
+          const f = String(r.fitness_certificate_status || r.model || '').toLowerCase();
+          const j = String(r.job_card_status || r.status || '').toLowerCase();
+          const c = String(r.cleaning_status || '').toLowerCase();
+          const isInvalid = f.includes('expired') || f.includes('revoked') || f.includes('invalid');
+          const hasOpen = j.includes('open') || j.includes('major') || j.includes('critical');
+          let category: 'ready'|'cleaning'|'maintenance' = 'ready';
+          if (isInvalid) category = 'maintenance';
+          else if (c.includes('pending')) category = 'cleaning';
+          (groups[category] as any[]).push(r);
+        }
 
         // If still nothing meaningful, try csv_upload_rows (source-of-truth for last upload)
         if (!enriched.length) {
@@ -318,21 +866,17 @@ const Admin = () => {
               mileage: Number(r.mileage) || 0
             };
             let { total } = computeScore(row, { fleetAvgKm30d: avgMileage });
-            try {
-              if (import.meta.env.VITE_OPENROUTER_API_KEY || import.meta.env.VITE_GROQ_API_KEY) {
-                const prompt = buildPromptFromRow(row);
-                const apiRes = await runScoring(prompt, row);
-                const parsedNum = typeof apiRes === 'number' ? apiRes : parseFloat(String(apiRes).match(/-?\d+(?:\.\d+)?/)?.[0] || '');
-                if (!Number.isNaN(parsedNum)) total = parsedNum;
-              }
-            } catch {}
+          // Remote scoring disabled; use local
             return { ...r, score: total };
           }));
           return setRecentResults(scored.sort((a: any, b: any) => (b.score ?? 0) - (a.score ?? 0)));
         }
         if (enriched.length > 0) {
-          setRecentResults(enriched);
-          saveListing(enriched);
+          setRecentResults(rankedNsga);
+          setReadyResults(groups.ready);
+          setCleaningResults(groups.cleaning);
+          setMaintenanceResults(groups.maintenance);
+          saveListing(rankedNsga);
         }
       } else {
         const rows = data || [];
@@ -385,22 +929,50 @@ const Admin = () => {
             mileage: mileageNum
           };
           let { total } = computeScore(row, { fleetAvgKm30d: avgMileage });
-          try {
-            if (import.meta.env.VITE_OPENROUTER_API_KEY || import.meta.env.VITE_GROQ_API_KEY) {
-              const prompt = buildPromptFromRow(row);
-              const apiRes = await runScoring(prompt, row);
-              const parsed = typeof apiRes === 'number' ? apiRes : parseFloat(String(apiRes).match(/-?\d+(?:\.\d+)?/)?.[0] || '');
-              if (!Number.isNaN(parsed)) total = parsed;
-            }
-          } catch {}
+          // Remote scoring disabled; use local
           return { ...r, score: total };
         }))
-        // Sort by score desc
         .sort((a: any, b: any) => (b.score ?? 0) - (a.score ?? 0));
 
+        // NSGA-II
+        const rows2 = enriched.map((r: any) => {
+          const f = String(r.fitness_certificate_status || '').toLowerCase();
+          const j = String(r.job_card_status || '').toLowerCase();
+          const b = String(r.branding_priority || '').toLowerCase();
+          const c = String(r.cleaning_status || '').toLowerCase();
+          const stab = String(r.stabling_position || '').toLowerCase();
+          const mileageNum = typeof r.mileage === 'number' ? r.mileage : parseInt(String(r.mileage || '0'), 10) || 0;
+          const fitnessInvalid = (f.includes('expired') || f.includes('revoked')) ? 1 : 0;
+          const jobs = j.includes('open') || j.includes('major') || j.includes('critical') ? 1 : j.includes('minor') || j.includes('pending') ? 0.5 : 0;
+          const branding = b === 'high' ? 1 : b === 'medium' ? 0.5 : 0;
+          const mileageDev = Math.abs(mileageNum - avgMileage);
+          const cleaningNeed = c.includes('clean') ? 0 : 1;
+          const geometry = stab ? 0 : 0.5;
+          return { base: r, objectives: [fitnessInvalid, jobs, branding, mileageDev, cleaningNeed, geometry] };
+        });
+        const normalized2 = normalizeObjectives(rows2.map(r => r.objectives));
+        const items2: NSGAItem<any>[] = normalized2.map((obj, i) => ({ data: rows2[i].base, objectives: obj }));
+        const rankedNsga2 = nsgaRank(items2).map(it => ({ ...it.data, nsga_rank: it.rank, nsga_crowding: it.crowding }));
+
+        const groups2 = { ready: [] as any[], cleaning: [] as any[], maintenance: [] as any[] };
+        for (const r of rankedNsga2) {
+          const f = String(r.fitness_certificate_status || '').toLowerCase();
+          const j = String(r.job_card_status || '').toLowerCase();
+          const c = String(r.cleaning_status || '').toLowerCase();
+          const isInvalid = f.includes('expired') || f.includes('revoked') || f.includes('invalid');
+          const hasOpen = j.includes('open') || j.includes('major') || j.includes('critical');
+          let category: 'ready'|'cleaning'|'maintenance' = 'ready';
+          if (isInvalid) category = 'maintenance';
+          else if (c.includes('pending')) category = 'cleaning';
+          (groups2[category] as any[]).push(r);
+        }
+
         if (enriched.length > 0) {
-          setRecentResults(enriched);
-          saveListing(enriched);
+          setRecentResults(rankedNsga2);
+          setReadyResults(groups2.ready);
+          setCleaningResults(groups2.cleaning);
+          setMaintenanceResults(groups2.maintenance);
+          saveListing(rankedNsga2);
         }
       }
     } catch {
@@ -642,15 +1214,32 @@ const Admin = () => {
     fetchTrainInfo();
   }, []);
 
+  // When navigating from /upload with state { goResults: true }, jump to Step 3 and load results
+  useEffect(() => {
+    try {
+      const state: any = (location as any).state;
+      if (state && state.goResults) {
+        setFromFlow(true);
+        setCurrentStep('results');
+        // Clear the navigation state so it doesn't retrigger on future renders
+        window.history.replaceState({}, document.title, location.pathname);
+      }
+    } catch {}
+  }, [location]);
+
   useEffect(() => {
     if (currentStep === 'results') {
       (async () => {
+        setResultsLoading(true);
         try {
-          setResultsLoading(true);
-          const hadCache = await scoreCachedResults();
-          // always refresh from DB too
-          await fetchRecentResults();
+          // Always try cached results first (works even if DB writes failed)
+          const gotCached = await scoreCachedResults();
+          if (!gotCached) {
+            // Fall back to DB-derived results (works when upload persisted)
+            await fetchRecentResults();
+          }
         } finally {
+          setFromFlow(false);
           setResultsLoading(false);
         }
       })();
@@ -671,14 +1260,37 @@ const Admin = () => {
     }
 
   return (
-    <div className="container mx-auto p-6 space-y-6">
+    <div className="container mx-auto p-4 sm:p-6 space-y-6">
+      {aiLoading && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/35 backdrop-blur-sm">
+          <div className="flex flex-col items-center gap-4">
+            {/* Preferred player */}
+            <dotlottie-player
+              src="https://lottie.host/2488349c-987e-450b-a9e6-5e60ff448e28/yqzciuzw9p.lottie"
+              autoplay
+              loop
+              style={{ width: '360px', height: '360px' } as any}
+            />
+            <div className="text-lg font-semibold text-white drop-shadow">Comparing with AI…</div>
+          </div>
+        </div>
+      )}
       {/* Header */}
-      <div className={`flex justify-between items-center sticky top-0 z-40 bg-background/80 backdrop-blur supports-[backdrop-filter]:bg-background/60 border-b py-3 px-2 rounded-none ${resultsLoading ? 'invisible' : ''}`}>
+      <div className={`flex flex-col sm:flex-row justify-between items-start sm:items-center sticky top-0 z-40 bg-background/80 backdrop-blur supports-[backdrop-filter]:bg-background/60 border-b py-3 px-2 rounded-none gap-2 ${resultsLoading ? 'invisible' : ''}`}>
         <div>
           <h1 className="text-3xl font-bold text-foreground">Admin Dashboard</h1>
           <p className="text-muted-foreground">Manage train information and daily data</p>
       </div>
-      <div className="flex items-center gap-2">
+      <div className="flex flex-wrap items-center gap-2 w-full sm:w-auto">
+          <Button
+            size="sm"
+            variant={currentStep === 'dataset-upload' ? 'default' : 'outline'}
+            className="rounded-full"
+            onClick={() => setCurrentStep('dataset-upload')}
+          >
+            Step 0: Dataset Upload
+          </Button>
+          <ArrowRight className="w-4 h-4" />
           <Button
             size="sm"
             variant={currentStep === 'train-info' ? 'default' : 'outline'}
@@ -707,6 +1319,15 @@ const Admin = () => {
           </Button>
         </div>
       </div>
+
+      {/* Step 0: Dataset Upload */}
+      {currentStep === 'dataset-upload' && (
+        <DatasetUpload
+          onBack={() => setCurrentStep('train-info')}
+          onGoToCSVUpload={() => setCurrentStep('csv-upload')}
+          onProceedResults={() => { setFromFlow(true); setCurrentStep('results'); }}
+        />
+      )}
 
       {/* Step 1: Train Info Management */}
       {currentStep === 'train-info' && (
@@ -884,6 +1505,7 @@ const Admin = () => {
             </div>
           )}
 
+          <div className="overflow-x-auto">
           <Table>
             <TableHeader>
               <TableRow>
@@ -926,6 +1548,7 @@ const Admin = () => {
               ))}
             </TableBody>
           </Table>
+          </div>
 
                 <div className="flex justify-end pt-4">
                   <Button onClick={handleContinueToCSV} size="lg">
@@ -953,47 +1576,231 @@ const Admin = () => {
           {/* Loading overlay intentionally removed as requested */}
           <Card>
             <CardHeader>
-              <CardTitle>Recently Processed Trains</CardTitle>
+              <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3">
+                <CardTitle>Recently Processed Trains</CardTitle>
+                <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2 w-full sm:w-auto">
+                  <label htmlFor="resultsFilter" className="text-sm text-muted-foreground">Show</label>
+                  <select
+                    id="resultsFilter"
+                    className="border rounded px-2 py-1 text-sm bg-background w-full sm:w-auto"
+                    value={resultsFilter}
+                    onChange={(e) => setResultsFilter(e.target.value as any)}
+                  >
+                    <option value="all">All</option>
+                    <option value="ready">Revenue Service</option>
+                    <option value="cleaning">Cleaning / Detailing</option>
+                    <option value="maintenance">Inspection Bay (Maintenance)</option>
+                  </select>
+                {/* What-If Simulator trigger */}
+                <Sheet open={whatIfOpen} onOpenChange={setWhatIfOpen}>
+                  <SheetTrigger asChild>
+                    <Button size="sm" className="w-full sm:w-auto" variant="outline">What-If</Button>
+                  </SheetTrigger>
+                  <SheetContent side="right" className="w-full sm:max-w-xl">
+                    <SheetHeader>
+                      <SheetTitle>What-If Simulator</SheetTitle>
+                      <SheetDescription>
+                        Ask questions like: "What if Train 13 job card Closed?" or "What if mileage of Train 15 increased by 10000?" We simulate and re-rank locally.
+                      </SheetDescription>
+                    </SheetHeader>
+                    <div className="mt-4 space-y-3">
+                      <Textarea
+                        placeholder="Type your scenario..."
+                        value={whatIfQuery}
+                        onChange={(e) => setWhatIfQuery(e.target.value)}
+                        className="min-h-[120px]"
+                      />
+                      <div className="flex items-center gap-2">
+                        <Button onClick={runWhatIf} disabled={whatIfLoading || !recentResults.length}>
+                          {whatIfLoading ? 'Simulating…' : 'Run What-If'}
+                        </Button>
+                        <Button variant="ghost" onClick={() => setWhatIfQuery("")}>Clear</Button>
+                      </div>
+                      {whatIfAnswer && (
+                        <Card>
+                          <CardHeader>
+                            <CardTitle className="text-sm">Result</CardTitle>
+                          </CardHeader>
+                          <CardContent>
+                            <div className="whitespace-pre-wrap text-sm leading-relaxed">{whatIfAnswer}</div>
+                          </CardContent>
+                        </Card>
+                      )}
+                    </div>
+                    <SheetFooter />
+                  </SheetContent>
+                </Sheet>
+                <Button size="sm" className="w-full sm:w-auto" variant="secondary" onClick={compareWithAI} disabled={aiLoading}>
+                  {aiLoading ? (
+                    <span className="inline-flex items-center gap-3">
+                      <span className="relative w-10 h-10">
+                        <dotlottie-player
+                          src="https://lottie.host/2488349c-987e-450b-a9e6-5e60ff448e28/yqzciuzw9p.lottie"
+                          autoplay
+                          loop
+                          style={{ width: '40px', height: '40px' } as any}
+                        />
+                      </span>
+                      Searching…
+                    </span>
+                  ) : 'Compare with AI'}
+                </Button>
+                  <Button
+                    size="sm"
+                    className="w-full sm:w-auto"
+                    onClick={async () => {
+                      try {
+                        await saveListing(recentResults);
+                        toast({ title: 'Saved', description: 'Current scheduling list saved to listing table.' });
+                      } catch {}
+                    }}
+                  >
+                    Save to Listing
+                  </Button>
+                </div>
+              </div>
             </CardHeader>
             <CardContent>
-              <div className="text-left py-4 space-y-4">
+              <div className="text-left py-4 space-y-10">
                 {recentResults.length === 0 ? (
                   <p className="text-sm text-muted-foreground">No results yet. Try uploading a CSV, then return to this page.</p>
                 ) : (
-                  <Table>
-                    <TableHeader>
-                      <TableRow>
-                        <TableHead>Train ID</TableHead>
-                        <TableHead>Score</TableHead>
-                        <TableHead>Fitness</TableHead>
-                        <TableHead>Job Cards</TableHead>
-                        <TableHead>Branding</TableHead>
-                        <TableHead>Mileage</TableHead>
-                        <TableHead>Cleaning</TableHead>
-                        <TableHead>Stabling</TableHead>
-                        <TableHead>Updated</TableHead>
-                      </TableRow>
-                    </TableHeader>
-                    <TableBody>
-                      {recentResults.map((r, idx) => (
-                        <TableRow key={idx}>
-                          <TableCell className="font-medium">{r.train_id || '-'}</TableCell>
-                          <TableCell>{(r.score ?? 0).toFixed(2)}</TableCell>
-                          <TableCell>{r.fitness_certificate_status ?? r.model ?? '-'}</TableCell>
-                          <TableCell>{r.job_card_status ?? r.status ?? '-'}</TableCell>
-                          <TableCell>{r.branding_priority ?? '-'}</TableCell>
-                          <TableCell>{typeof r.mileage === 'number' ? r.mileage.toLocaleString() : (r.mileage ?? '-')}</TableCell>
-                          <TableCell>{r.cleaning_status ?? '-'}</TableCell>
-                          <TableCell>{r.stabling_position ?? '-'}</TableCell>
+                  <>
+                    {(resultsFilter === 'all' || resultsFilter === 'ready') && (
+                    <div>
+                      <h3 className="text-lg font-semibold mb-2">Revenue Service</h3>
+                      <div className="overflow-x-auto">
+                      <Table>
+                        <TableHeader>
+                          <TableRow>
+                            <TableHead>Train ID</TableHead>
+                          <TableHead>Pareto Rank</TableHead>
+                            <TableHead>Fitness</TableHead>
+                            <TableHead>Job Cards</TableHead>
+                            <TableHead>Branding</TableHead>
+                            <TableHead>Mileage</TableHead>
+                            <TableHead>Cleaning</TableHead>
+                            <TableHead>Stabling</TableHead>
+                          <TableHead>Updated</TableHead>
+                          <TableHead>Info</TableHead>
+                          </TableRow>
+                        </TableHeader>
+                        <TableBody>
+                          {readyResults.map((r, idx) => (
+                            <TableRow key={idx}>
+                              <TableCell className="font-medium">{r.train_id || '-'}</TableCell>
+                              <TableCell>{r.nsga_rank ?? '-'}</TableCell>
+                              <TableCell>{r.fitness_certificate_status ?? r.model ?? '-'}</TableCell>
+                              <TableCell>{r.job_card_status ?? r.status ?? '-'}</TableCell>
+                              <TableCell>{r.branding_priority ?? '-'}</TableCell>
+                              <TableCell>{typeof r.mileage === 'number' ? r.mileage.toLocaleString() : (r.mileage ?? '-')}</TableCell>
+                              <TableCell>{r.cleaning_status ?? '-'}</TableCell>
+                              <TableCell>{r.stabling_position ?? '-'}</TableCell>
                           <TableCell>{new Date(r.updated_at || r.created_at || Date.now()).toLocaleString()}</TableCell>
-                        </TableRow>
-                      ))}
-                    </TableBody>
-                  </Table>
+                          <TableCell>{renderInfoCell(r)}</TableCell>
+                            </TableRow>
+                          ))}
+                        </TableBody>
+                      </Table>
+                      </div>
+                    </div>
+                    )}
+
+                    {(resultsFilter === 'all' || resultsFilter === 'cleaning') && (
+                    <div>
+                      <h3 className="text-lg font-semibold mb-2">Cleaning / Detailing</h3>
+                      <div className="overflow-x-auto">
+                      <Table>
+                        <TableHeader>
+                          <TableRow>
+                            <TableHead>Train ID</TableHead>
+                          <TableHead>Pareto Rank</TableHead>
+                            <TableHead>Fitness</TableHead>
+                            <TableHead>Job Cards</TableHead>
+                            <TableHead>Branding</TableHead>
+                            <TableHead>Mileage</TableHead>
+                            <TableHead>Cleaning</TableHead>
+                            <TableHead>Stabling</TableHead>
+                          <TableHead>Updated</TableHead>
+                          <TableHead>Info</TableHead>
+                          </TableRow>
+                        </TableHeader>
+                        <TableBody>
+                          {cleaningResults.map((r, idx) => (
+                            <TableRow key={idx}>
+                              <TableCell className="font-medium">{r.train_id || '-'}</TableCell>
+                              <TableCell>{r.nsga_rank ?? '-'}</TableCell>
+                              <TableCell>{r.fitness_certificate_status ?? r.model ?? '-'}</TableCell>
+                              <TableCell>{r.job_card_status ?? r.status ?? '-'}</TableCell>
+                              <TableCell>{r.branding_priority ?? '-'}</TableCell>
+                              <TableCell>{typeof r.mileage === 'number' ? r.mileage.toLocaleString() : (r.mileage ?? '-')}</TableCell>
+                              <TableCell>{r.cleaning_status ?? '-'}</TableCell>
+                              <TableCell>{r.stabling_position ?? '-'}</TableCell>
+                          <TableCell>{new Date(r.updated_at || r.created_at || Date.now()).toLocaleString()}</TableCell>
+                          <TableCell>{renderInfoCell(r)}</TableCell>
+                            </TableRow>
+                          ))}
+                        </TableBody>
+                      </Table>
+                      </div>
+                    </div>
+                    )}
+
+                    {(resultsFilter === 'all' || resultsFilter === 'maintenance') && (
+                    <div>
+                      <h3 className="text-lg font-semibold mb-2">Inspection Bay (Maintenance)</h3>
+                      <div className="overflow-x-auto">
+                      <Table>
+                        <TableHeader>
+                          <TableRow>
+                            <TableHead>Train ID</TableHead>
+                          <TableHead>Pareto Rank</TableHead>
+                            <TableHead>Fitness</TableHead>
+                            <TableHead>Job Cards</TableHead>
+                            <TableHead>Branding</TableHead>
+                            <TableHead>Mileage</TableHead>
+                            <TableHead>Cleaning</TableHead>
+                            <TableHead>Stabling</TableHead>
+                          <TableHead>Updated</TableHead>
+                          <TableHead>Info</TableHead>
+                          </TableRow>
+                        </TableHeader>
+                        <TableBody>
+                          {maintenanceResults.map((r, idx) => (
+                            <TableRow key={idx}>
+                              <TableCell className="font-medium">{r.train_id || '-'}</TableCell>
+                              <TableCell>{r.nsga_rank ?? '-'}</TableCell>
+                              <TableCell>{r.fitness_certificate_status ?? r.model ?? '-'}</TableCell>
+                              <TableCell>{r.job_card_status ?? r.status ?? '-'}</TableCell>
+                              <TableCell>{r.branding_priority ?? '-'}</TableCell>
+                              <TableCell>{typeof r.mileage === 'number' ? r.mileage.toLocaleString() : (r.mileage ?? '-')}</TableCell>
+                              <TableCell>{r.cleaning_status ?? '-'}</TableCell>
+                              <TableCell>{r.stabling_position ?? '-'}</TableCell>
+                          <TableCell>{new Date(r.updated_at || r.created_at || Date.now()).toLocaleString()}</TableCell>
+                          <TableCell>{renderInfoCell(r)}</TableCell>
+                            </TableRow>
+                          ))}
+                        </TableBody>
+                      </Table>
+                      </div>
+                    </div>
+                    )}
+                  </>
                 )}
               </div>
             </CardContent>
+            <Dialog open={infoOpen} onOpenChange={setInfoOpen}>
+              <DialogContent className="sm:max-w-lg">
+                <DialogHeader>
+                  <DialogTitle>{infoContent?.title || 'Details'}</DialogTitle>
+                  <DialogDescription asChild>
+                    <div className="whitespace-pre-wrap text-left text-sm">{infoContent?.description}</div>
+                  </DialogDescription>
+                </DialogHeader>
+              </DialogContent>
+            </Dialog>
           </Card>
+        {/* Dialog removed; comparison now opens on a full page */}
         </>
       )}
     </div>

@@ -341,7 +341,7 @@ export const DashboardCharts = () => {
   return (
     <div className="space-y-5 flex-1">
       {/* First Row - All Pie Charts */}
-      <div className="grid gap-5 grid-cols-1 md:grid-cols-4 h-[240px]">
+      <div className="grid gap-5 grid-cols-1 sm:grid-cols-2 md:grid-cols-4 h-auto">
         <PieChart
           title="Train Status"
           data={processTrainStatus()}
@@ -388,7 +388,7 @@ export const DashboardCharts = () => {
       </div>
 
       {/* Second Row - Bar Charts & CSV Uploads */}
-      <div className="grid gap-5 grid-cols-1 md:grid-cols-3 h-[240px]">
+      <div className="grid gap-5 grid-cols-1 sm:grid-cols-2 md:grid-cols-3 h-auto">
         <BarChart
           title="Branding Priority"
           data={processBrandingPriority()}

@@ -37,56 +37,13 @@ async function callWithTimeout(url: string, options: RequestInit, timeoutMs: num
   }
 }
 
-export async function callOpenRouter(prompt: string): Promise<string> {
-  const key = import.meta.env.VITE_OPENROUTER_API_KEY as string | undefined;
-  if (!key) throw new Error('OpenRouter key missing');
-  const res = await callWithTimeout(
-    OPENROUTER_URL,
-    {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${key}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        model: 'anthropic/claude-3.5-sonnet',
-        messages: [{ role: 'user', content: prompt }],
-      }),
-    },
-    8000
-  );
-
-  if (!res.ok) throw new Error(`OpenRouter HTTP ${res.status}`);
-  const data = await res.json();
-  const content = data?.choices?.[0]?.message?.content;
-  if (!content) throw new Error('OpenRouter: empty response');
-  return content as string;
+// Disabled remote calls: using local scoring only
+export async function callOpenRouter(_prompt: string): Promise<string> {
+  throw new Error('Remote scoring disabled');
 }
 
-export async function callGroq(prompt: string): Promise<string> {
-  const key = import.meta.env.VITE_GROQ_API_KEY as string | undefined;
-  if (!key) throw new Error('Groq key missing');
-  const res = await callWithTimeout(
-    GROQ_URL,
-    {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${key}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        model: 'llama-3.1-70b-versatile',
-        messages: [{ role: 'user', content: prompt }],
-      }),
-    },
-    8000
-  );
-
-  if (!res.ok) throw new Error(`Groq HTTP ${res.status}`);
-  const data = await res.json();
-  const content = data?.choices?.[0]?.message?.content;
-  if (!content) throw new Error('Groq: empty response');
-  return content as string;
+export async function callGroq(_prompt: string): Promise<string> {
+  throw new Error('Remote scoring disabled');
 }
 
 // Simple local fallback using baseline weights. Replace with full formulas when inputs are available.
@@ -251,15 +208,8 @@ export function computeScore(row: TrainRow, ctx: ScoringContext = {}): { total: 
 }
 
 export async function runScoring(prompt: string, row: TrainRow): Promise<number | string> {
-  try {
-    return await callOpenRouter(prompt);
-  } catch {
-    try {
-      return await callGroq(prompt);
-    } catch {
-      return localScoring(row);
-    }
-  }
+  // Always use local scoring per requirement (no external APIs)
+  return localScoring(row);
 }
 
 export function buildPromptFromRow(row: TrainRow): string {

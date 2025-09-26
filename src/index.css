@@ -103,3 +103,119 @@ All colors MUST be HSL.
     @apply bg-background text-foreground;
   }
 }
+
+/* Animated Metro Gallery - keyframes and utility classes */
+@keyframes fadeInUp {
+  from { opacity: 0; transform: translateY(40px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+@keyframes bounceIn {
+  0%   { opacity: 0; transform: scale(0.3); }
+  50%  { opacity: 1; transform: scale(1.05); }
+  70%  { transform: scale(0.9); }
+  100% { opacity: 1; transform: scale(1); }
+}
+@keyframes flipUp {
+  0%   { opacity: 0; transform: perspective(400px) rotateX(90deg); }
+  100% { opacity: 1; transform: perspective(400px) rotateX(0); }
+}
+
+.fadeInUp { animation: fadeInUp 1s ease; }
+.bounceIn { animation: bounceIn 1s; }
+.flipUp { animation: flipUp 1s; }
+.animated-img {
+  display: block;
+  margin: 40px auto;
+  max-width: 350px;
+  border-radius: 8px;
+  box-shadow: 0 2px 12px rgba(0,0,0,0.09);
+}
+
+/* Parallax MouseMove Images */
+.parallax-container {
+  position: relative;
+  width: 100vw;
+  height: 100vh;
+  overflow: hidden;
+  perspective: 1200px;
+}
+.parallax-img {
+  position: absolute;
+  transition: transform 0.35s cubic-bezier(0.2, 0.8, 0.2, 1);
+  will-change: transform;
+  pointer-events: none;
+}
+.img1 { top: 10%; left: 15%; width: 200px; z-index: 1; }
+.img2 { top: 60%; left: 60%; width: 180px; z-index: 2; }
+.img3 { top: 30%; left: 50%; width: 260px; z-index: 3; }
+.img4 { top: 70%; left: 20%; width: 170px; z-index: 3; }
+
+/* Centered Parallax Hero Image */
+.parallax-bg {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100vw;
+  height: 100vh;
+  overflow: hidden;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.parallax-hero-img {
+  width: 80vw;
+  max-width: 900px;
+  transition: transform 0.4s cubic-bezier(0.23, 1, 0.32, 1);
+  will-change: transform;
+  box-shadow: 0 6px 32px rgba(0, 0, 0, 0.08);
+  border-radius: 20px;
+  background: #fff;
+}
+
+/* Multi-layer Parallax (depth-based) */
+.layer {
+  position: absolute;
+  will-change: transform;
+  transition: transform 0.3s cubic-bezier(0.2, 0.8, 0.2, 1);
+  pointer-events: none;
+}
+/* Example positions and sizes */
+.roads { left: 84px; top: 328px; width: 550px; z-index: 5; }
+.buildingBack { left: 676px; top: 252px; width: 73px; z-index: 7; }
+.buildingFront { left: 607px; top: 206px; width: 87px; z-index: 8; }
+.sunrise { left: -68px; top: 201px; width: 377px; z-index: 9; }
+.train { left: 166px; top: 135px; width: 537px; z-index: 11; }
+.boat { left: 148px; top: 360px; width: 261px; z-index: 12; }
+.clock { left: 288px; top: 397px; width: 309px; z-index: 13; }
+.label { left: 636px; top: 304px; width: 105px; z-index: 14; }
+/* RL.png placement between clock and dashboard */
+.rl {
+  left: 575px; /* further onto the road */
+  top: 385px; /* move up so it's fully visible */
+  width: 185px; /* bigger */
+  z-index: 13; /* above road, below monitor accent */
+}
+
+/* Fullscreen responsive wrapper for multi-layer parallax */
+.parallax-viewport {
+  position: relative;
+  width: 100vw;
+  min-height: 100vh;
+  overflow: visible;
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  background: #ffffff; /* light mode */
+}
+.parallax-stage {
+  position: relative;
+  width: 1248px; /* design width */
+  height: 612px;  /* design height */
+  transform: translate(var(--ml-offset-x, 0px), var(--ml-offset-y, 0px)) scale(var(--ml-scale, 1));
+  transform-origin: center center;
+}
+
+/* Dark mode backdrop */
+.dark .parallax-viewport {
+  background: #0b1220;
+}
